@@ -32,6 +32,9 @@ permissions:
 # CMakeLists.txt 里读的是「环境变量」DIRETTA_SDK_PATH，不是 -D 参数，别写错
 env:
   DIRETTA_SDK_PATH: ${{ github.workspace }}/DirettaHostSDK
+  # 强制优先用源码构建的 FFmpeg（/usr/local），否则会被系统自带的 FFmpeg 4.4 抢先解析
+  # （PKG_CONFIG_PATH 是「前置」到默认搜索路径，不是替换）
+  PKG_CONFIG_PATH: /usr/local/lib/pkgconfig
 
 jobs:
   build:
@@ -46,9 +49,11 @@ jobs:
           - runner: ubuntu-22.04
             arch: x64
             sdk_arch: x64-linux-15v2        # 基线 x86-64（-march=x86-64，不用 AVX2），兼容面最广
+            ffmpeg_ver: '5.1.2'             # 见下方「Build FFmpeg from source」注释，可改 7.1 / 8.0.1
           - runner: ubuntu-22.04-arm
             arch: arm64
             sdk_arch: aarch64-linux-15      # 非 16K 页（getconf PAGESIZE=4096），已确认
+            ffmpeg_ver: '5.1.2'
 
           # ---- 若 22.04 的 FFmpeg 4.4 太老编不过，改用这组（glibc 2.39 / FFmpeg 6.1）----
           #      注意：glibc 2.39 的产物在 Debian 11 等老系统上会直接跑不起来
@@ -68,16 +73,104 @@ jobs:
       # ---------------------------------------------------------------------
       - name: Install build dependencies
         run: |
+          set -eo pipefail
           sudo apt-get update
+          # 注意：这里【故意不装】libav*-dev。系统自带 FFmpeg 4.4 太老，
+          # 装了反而会跟源码构建的 FFmpeg 抢 pkg-config 解析。
           sudo apt-get install -y --no-install-recommends \
             build-essential cmake pkg-config \
-            libavcodec-dev libavformat-dev libavutil-dev libswresample-dev \
-            libssl-dev zlib1g-dev liblzma-dev libbz2-dev
+            libssl-dev zlib1g-dev liblzma-dev libbz2-dev \
+            libgnutls28-dev libsoxr-dev
+          # nasm/yasm 只用于 x86 的 SIMD 优化，arm64 上装不上也不影响构建
+          sudo apt-get install -y --no-install-recommends nasm yasm \
+            || echo "::warning::nasm/yasm 未装上（arm64 上非必需，继续）"
           echo "==== 环境自检 ===="
           cmake --version | head -1
           g++ --version | head -1
-          echo "FFmpeg(libavcodec): $(pkg-config --modversion libavcodec)"
           echo "glibc: $(ldd --version | head -1)"
+          echo "系统自带 FFmpeg（仅参照，后面会用源码构建的覆盖）: $(pkg-config --modversion libavcodec 2>/dev/null || echo '无')"
+
+      # ---------------------------------------------------------------------
+      # ★ FFmpeg 必须 >= 5.1（源码构建）
+      #
+      # 为什么不能用系统包：AudioEngine.cpp 用的是 FFmpeg 5.1 才引入的
+      # 「新声道布局 API」——
+      #     AVChannelLayout            / av_channel_layout_default()
+      #     AVCodecContext::ch_layout  / swr_alloc_set_opts2()
+      # Ubuntu 22.04 自带的 FFmpeg 4.4 只有旧 API（channel_layout /
+      # swr_alloc_set_opts），编译直接报：
+      #     error: 'AVChannelLayout' was not declared in this scope
+      #     error: 'AVCodecContext' has no member named 'ch_layout'
+      # 项目自带的 install_ffmpeg.sh 提供的三个选项（5.1.2 / 7.1 / 8.0.1）
+      # 也都是 >= 5.1，正好印证了这一点。
+      #
+      # 下面的 configure 选项【逐条复制自项目自带的 install_ffmpeg.sh
+      # 里 get_ffmpeg_full_opts()】，只额外加了 --disable-programs
+      # （不构建 ffmpeg/ffprobe 命令行，省几分钟，动态库完全不受影响）。
+      #
+      # ffmpeg_ver 怎么选：
+      #   5.1.2 → soname 是 libavcodec.so.59，与 Debian 12 / Armbian bookworm
+      #           系统自带的 FFmpeg 5.1.7 完全一致，目标机上不用另装 FFmpeg（推荐）
+      #   7.1   → libavcodec.so.61（Ubuntu 24.04 系）
+      #   8.0.1 → libavcodec.so.62（最新；注意作者那边 8.x 是「最小化」配置）
+      # 目标机 FFmpeg 版本不一致也没关系 —— 产物里会附带本次构建出的 .so，
+      # 用 LD_LIBRARY_PATH 指过去即可（见后面的 Stage artifact）。
+      # ---------------------------------------------------------------------
+      - name: Build FFmpeg from source
+        run: |
+          set -eo pipefail
+          FFMPEG_VERSION='${{ matrix.ffmpeg_ver }}'
+          echo "==== 构建 FFmpeg ${FFMPEG_VERSION}（仅动态库，不构建命令行程序）===="
+          cd /tmp
+          curl -fsSL --retry 3 --retry-delay 5 -o ffmpeg.tar.xz \
+            "https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VERSION}.tar.xz"
+          tar xf ffmpeg.tar.xz
+          cd "ffmpeg-${FFMPEG_VERSION}"
+
+          OPTS=(
+            --prefix=/usr/local
+            --enable-shared
+            --disable-static
+            --enable-gpl
+            --enable-version3
+            --enable-gnutls
+            --enable-libsoxr
+            --disable-debug
+            --disable-doc
+            --disable-autodetect
+            --disable-programs
+            --enable-network
+            --enable-protocol=file,http,https,tcp,pipe
+            --enable-demuxer=flac,wav,dsf,dff,mov,aac,mp3,ogg
+            --enable-decoder=flac,alac,pcm_s16le,pcm_s24le,pcm_s32le,pcm_f32le,dsd_lsbf,dsd_msbf,dsd_lsbf_planar,dsd_msbf_planar,aac,mp3,vorbis
+            --enable-parser=aac,flac,mpegaudio
+            --enable-filter=aresample
+          )
+
+          echo "---- configure ----"
+          ./configure "${OPTS[@]}" > /tmp/ffmpeg-configure.log 2>&1 || {
+            echo "::error::FFmpeg configure 失败，日志末尾："
+            tail -40 /tmp/ffmpeg-configure.log
+            exit 1
+          }
+          echo "configure 通过"
+
+          echo "---- make -j$(nproc)（这一步要几分钟，静默属正常）----"
+          make -j"$(nproc)" > /tmp/ffmpeg-make.log 2>&1 || {
+            echo "::error::FFmpeg 编译失败，日志末尾："
+            tail -60 /tmp/ffmpeg-make.log
+            exit 1
+          }
+          sudo make install
+          sudo ldconfig
+
+          echo "==== 装好的 FFmpeg ===="
+          for p in libavcodec libavformat libavutil libswresample; do
+            echo "  $p = $(pkg-config --modversion "$p")   libdir=$(pkg-config --variable=libdir "$p")"
+          done
+          MAJ="$(pkg-config --modversion libavcodec | cut -d. -f1)"
+          [ "$MAJ" -ge 59 ] || { echo "::error::解析到的 libavcodec 主版本是 $MAJ（< 59），说明仍指向系统 FFmpeg 4.4"; exit 1; }
+          ls -1 /usr/local/lib/libav*.so* /usr/local/lib/libswresample.so* 2>/dev/null | head -12
 
       # ---------------------------------------------------------------------
       # 取 SDK —— 方式 A：SDK 放私有仓库，用 PAT 拉（推荐，SDK 更新不用改 workflow）
@@ -258,30 +351,58 @@ jobs:
       - name: Configure
         run: |
           set -e
+          echo "==== cmake 将用到的 FFmpeg（应为 /usr/local 下源码构建的那套）===="
+          for p in libavcodec libavformat libavutil libswresample; do
+            echo "  $p = $(pkg-config --modversion "$p")   libdir=$(pkg-config --variable=libdir "$p")"
+          done
           mkdir -p build && cd build
           cmake .. -DDIRETTA_ARCH=${{ matrix.sdk_arch }}
           echo "==== 实际选中的 SDK 变体 / 编译参数 ===="
           grep -i -E "Selecting Diretta SDK variant|Using Diretta SDK|compile_options|CMAKE_CXX_FLAGS" \
             CMakeCache.txt CMakeFiles/CMakeOutput.log 2>/dev/null | head -10 || true
+          echo "==== cmake 最终解析到的 FFmpeg 库 / 头文件路径 ===="
+          grep -i -E "FFMPEG_(LIBRARIES|LIBRARY_DIRS|INCLUDE_DIRS)" CMakeCache.txt 2>/dev/null | head -10 || true
 
       - name: Build
         run: |
-          set -e
+          set -eo pipefail
           cd build
-          make -j"$(nproc)" 2>&1 | tail -40
+          # pipefail：不加的话 make 失败会被 tail 的 0 退出码吞掉，
+          # 最后只看到一句 "ls: cannot access 'DirettaLocalPlayer'"，看不出真因
+          make -j"$(nproc)" 2>&1 | tail -60
           echo "==== 产物 ===="
           ls -lh DirettaLocalPlayer
           file DirettaLocalPlayer
+          echo "==== 运行时依赖的 FFmpeg soname（拿去对比目标机）===="
+          objdump -p DirettaLocalPlayer 2>/dev/null | awk '/NEEDED/{print "  "$2}' | grep -E 'lib(av|sw)' || true
           echo "==== 链接的库 ===="
           ldd DirettaLocalPlayer || true
-          echo "==== 需要的 glibc 版本（对比目标机用） ===="
+          echo "==== 需要的 glibc 版本（对比目标机用）===="
           objdump -T DirettaLocalPlayer 2>/dev/null | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -5 || true
+
+      # ---------------------------------------------------------------------
+      # 打包：二进制 + 本次构建出的 FFmpeg 动态库
+      #   目标机的 FFmpeg 版本/ soname 对不上时，把 libs/ 一起拷过去即可：
+      #     chmod +x DirettaLocalPlayer
+      #     LD_LIBRARY_PATH=./libs ./DirettaLocalPlayer
+      # ---------------------------------------------------------------------
+      - name: Stage artifact
+        run: |
+          set -e
+          mkdir -p dist/libs
+          cp build/DirettaLocalPlayer dist/
+          chmod +x dist/DirettaLocalPlayer
+          cp -a /usr/local/lib/libavcodec.so* /usr/local/lib/libavformat.so* \
+                /usr/local/lib/libavutil.so* /usr/local/lib/libswresample.so* \
+                dist/libs/ 2>/dev/null || true
+          echo "==== dist 内容 ===="
+          ls -lh dist dist/libs
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: DirettaLocalPlayer-linux-${{ matrix.arch }}
-          path: build/DirettaLocalPlayer
+          path: dist/
           if-no-files-found: error
           retention-days: 30
 
@@ -297,14 +418,22 @@ jobs:
         run: |
           set -e
           TAG="${INPUT_TAG:-${GITHUB_REF_NAME}}"
-          OUT="DirettaLocalPlayer-linux-${{ matrix.arch }}"
-          cp build/DirettaLocalPlayer "$OUT"
-          chmod +x "$OUT"
+          OUT="DirettaLocalPlayer-linux-${{ matrix.arch }}.tar.gz"
+          tar czf "$OUT" -C dist .
+          ls -lh "$OUT"
+          # 注意：notes 用 printf 拼，别在 YAML 块标量里写裸换行 ——
+          # 掉到行首会让整个 workflow 解析失败
+          NOTES="$(printf '%s\n' \
+            "DirettaLocalPlayer 自动编译产物（${{ matrix.arch }} / SDK ${{ matrix.sdk_arch }} / FFmpeg ${{ matrix.ffmpeg_ver }}）" \
+            "" \
+            "内含二进制与本次构建出的 FFmpeg 动态库（libs/）。" \
+            "目标机若无同 soname 的 FFmpeg，把 libs/ 一起拷过去：" \
+            "  chmod +x DirettaLocalPlayer" \
+            "  LD_LIBRARY_PATH=./libs ./DirettaLocalPlayer")"
           if gh release view "$TAG" >/dev/null 2>&1; then
             echo "Release $TAG 已存在，追加附件"
           else
-            gh release create "$TAG" --title "$TAG" \
-              --notes "DirettaLocalPlayer 自动编译产物（${{ matrix.arch }}，SDK变体 ${{ matrix.sdk_arch }}）"
+            gh release create "$TAG" --title "$TAG" --notes "$NOTES"
           fi
           gh release upload "$TAG" "$OUT" --clobber
           echo "已上传: $OUT → $TAG"

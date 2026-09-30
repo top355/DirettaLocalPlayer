@@ -1,0 +1,235 @@
+# =============================================================================
+# DirettaLocalPlayer —— GitHub Actions 云端编译
+#
+# 放到仓库的 .github/workflows/build-dlp.yml
+#
+# 用法：
+#   1. 你在仓库里无脑点： Actions → Build DirettaLocalPlayer → Run workflow
+#      编完到本次运行页面底部下载 Artifact（需登录 GitHub）
+#   2. 想吃 Release 直链（Armbian 上 wget 直接下）：
+#          git tag v1.0 && git push origin v1.0
+#      或者手动触发时在 release_tag 里填个名字
+#
+# 前置条件（必读）：仓库里必须有 Diretta Host SDK，见文件末尾注释的两种配法
+# =============================================================================
+name: Build DirettaLocalPlayer
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: '可选：填了就创建同名 Release 并附上二进制（不填只出 Artifact）'
+        required: false
+        type: string
+  push:
+    tags:
+      - 'v*'
+
+# 创建 Release / 上传附件需要写权限
+permissions:
+  contents: write
+
+# CMakeLists.txt 里读的是「环境变量」DIRETTA_SDK_PATH，不是 -D 参数，别写错
+env:
+  DIRETTA_SDK_PATH: ${{ github.workspace }}/DirettaHostSDK
+
+jobs:
+  build:
+    name: Build (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+
+    strategy:
+      fail-fast: false          # 一个架构挂了另一个继续编
+      matrix:
+        include:
+          # ---- glibc 2.35 / FFmpeg 4.4：兼容优先（Debian 11+ / Ubuntu 22.04+ 都能跑）----
+          - runner: ubuntu-22.04
+            arch: x64
+            sdk_arch: x64-linux-15v3        # AVX2 / -march=haswell，兼容面最广
+          - runner: ubuntu-22.04-arm
+            arch: arm64
+            sdk_arch: aarch64-linux-15
+
+          # ---- 若 22.04 的 FFmpeg 4.4 太老编不过，改用这组（glibc 2.39 / FFmpeg 6.1）----
+          #      注意：glibc 2.39 的产物在 Debian 11 等老系统上会直接跑不起来
+          # - runner: ubuntu-24.04
+          #   arch: x64
+          #   sdk_arch: x64-linux-15v3
+          # - runner: ubuntu-24.04-arm
+          #   arch: arm64
+          #   sdk_arch: aarch64-linux-15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ---------------------------------------------------------------------
+      # 编译依赖：工具链 + FFmpeg 开发库（CMake 里是 pkg_check_modules REQUIRED）
+      # ---------------------------------------------------------------------
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake pkg-config \
+            libavcodec-dev libavformat-dev libavutil-dev libswresample-dev \
+            libssl-dev zlib1g-dev liblzma-dev libbz2-dev
+          echo "==== 环境自检 ===="
+          cmake --version | head -1
+          g++ --version | head -1
+          echo "FFmpeg(libavcodec): $(pkg-config --modversion libavcodec)"
+          echo "glibc: $(ldd --version | head -1)"
+
+      # ---------------------------------------------------------------------
+      # 取 SDK —— 方式 A：SDK 放私有仓库，用 PAT 拉（推荐，SDK 更新不用改 workflow）
+      #   需要的 Secrets： SDK_REPO = 例如 top355/diretta-host-sdk
+      #                    SDK_PAT  = 只给那个私有仓库 contents:read 的 fine-grained PAT
+      # ---------------------------------------------------------------------
+      - name: Fetch Diretta Host SDK (方式A - 私有仓库)
+        env:
+          SDK_REPO: ${{ secrets.SDK_REPO }}
+          SDK_PAT: ${{ secrets.SDK_PAT }}
+        run: |
+          set -e
+          if [ -z "${SDK_PAT:-}" ] || [ -z "${SDK_REPO:-}" ]; then
+            echo "::error::未配置 SDK_REPO / SDK_PAT。要么补 Secrets，要么改用方式B（见 workflow 注释）"
+            exit 1
+          fi
+          git clone --depth 1 --quiet \
+            "https://x-access-token:${SDK_PAT}@github.com/${SDK_REPO}.git" "$DIRETTA_SDK_PATH"
+          echo "SDK 已拉取到: $DIRETTA_SDK_PATH"
+
+      # ---------------------------------------------------------------------
+      # 取 SDK —— 方式 B：gpg 加密包提交进本仓库，口令存 Secrets
+      #   适用：不想建私有仓库。把 sdk/DirettaHostSDK_148.tar.gz.gpg 提交上来，
+      #         Secrets 里加 SDK_PASSPHRASE。
+      #   启用方式：注释掉上面的「方式A」step，打开下面这段。
+      # ---------------------------------------------------------------------
+      # - name: Decrypt Diretta Host SDK (方式B - 加密包)
+      #   env:
+      #     SDK_PASSPHRASE: ${{ secrets.SDK_PASSPHRASE }}
+      #   run: |
+      #     set -e
+      #     [ -n "${SDK_PASSPHRASE:-}" ] || { echo "::error::缺 SDK_PASSPHRASE"; exit 1; }
+      #     mkdir -p "$DIRETTA_SDK_PATH"
+      #     gpg --batch --yes --quiet --passphrase "$SDK_PASSPHRASE" \
+      #         --decrypt sdk/DirettaHostSDK_148.tar.gz.gpg \
+      #       | tar xz -C "$DIRETTA_SDK_PATH"
+
+      # ---------------------------------------------------------------------
+      # SDK 结构校验：CMake 会硬校验这两个 .a，缺一个就 FATAL_ERROR 直接停
+      # ---------------------------------------------------------------------
+      - name: Verify SDK layout
+        run: |
+          set -e
+          echo "==== SDK 根目录 ===="
+          ls -1 "$DIRETTA_SDK_PATH"
+          # 兼容 SDK 解压后多套一层目录的情况
+          if [ ! -d "$DIRETTA_SDK_PATH/lib" ]; then
+            inner="$(dirname "$(find "$DIRETTA_SDK_PATH" -maxdepth 2 -type d -name lib | head -n1)")"
+            if [ -n "$inner" ] && [ "$inner" != "." ]; then
+              echo "SDK 多套了一层 ($inner)，上提一层"
+              shopt -s dotglob
+              mv "$inner"/* "$DIRETTA_SDK_PATH"/
+              shopt -u dotglob
+            fi
+          fi
+          [ -d "$DIRETTA_SDK_PATH/Host" ] || echo "::warning::没看到 Host/ 目录，头文件可能找不到"
+          NEED_HOST="libDirettaHost_${{ matrix.sdk_arch }}.a"
+          NEED_ACQUA="libACQUA_${{ matrix.sdk_arch }}.a"
+          for f in "$NEED_HOST" "$NEED_ACQUA"; do
+            if [ ! -f "$DIRETTA_SDK_PATH/lib/$f" ]; then
+              echo "::error::缺少 $f"
+              echo "---- 该 SDK 实际提供的变体 ----"
+              ls -1 "$DIRETTA_SDK_PATH/lib" 2>/dev/null | head -40 || true
+              exit 1
+            fi
+          done
+          echo "SDK 校验通过: $NEED_HOST + $NEED_ACQUA"
+
+      # ---------------------------------------------------------------------
+      # 配置 + 编译
+      # 关键：显式 -DDIRETTA_ARCH，不要依赖自动探测！
+      #   云端 runner 是 AMD EPYC，CMakeLists 的 grep "amd.*zen 4" 可能命中，
+      #   于是编出 -march=znver4 的二进制 —— 拿到没有 AVX512/Zen4 的机器上直接 SIGILL
+      # ---------------------------------------------------------------------
+      - name: Configure
+        run: |
+          set -e
+          mkdir -p build && cd build
+          cmake .. -DDIRETTA_ARCH=${{ matrix.sdk_arch }}
+          echo "==== 实际选中的 SDK 变体 / 编译参数 ===="
+          grep -i -E "Selecting Diretta SDK variant|Using Diretta SDK|compile_options|CMAKE_CXX_FLAGS" \
+            CMakeCache.txt CMakeFiles/CMakeOutput.log 2>/dev/null | head -10 || true
+
+      - name: Build
+        run: |
+          set -e
+          cd build
+          make -j"$(nproc)" 2>&1 | tail -40
+          echo "==== 产物 ===="
+          ls -lh DirettaLocalPlayer
+          file DirettaLocalPlayer
+          echo "==== 链接的库 ===="
+          ldd DirettaLocalPlayer || true
+          echo "==== 需要的 glibc 版本（对比目标机用） ===="
+          objdump -T DirettaLocalPlayer 2>/dev/null | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -5 || true
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DirettaLocalPlayer-linux-${{ matrix.arch }}
+          path: build/DirettaLocalPlayer
+          if-no-files-found: error
+          retention-days: 30
+
+      # ---------------------------------------------------------------------
+      # 发布 Release（tag 推送 或 手动填了 release_tag 时）
+      # 好处：Release 直链下载不需要登录，Armbian 上 wget 一把梭
+      # ---------------------------------------------------------------------
+      - name: Publish to Release
+        if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -e
+          TAG="${INPUT_TAG:-${GITHUB_REF_NAME}}"
+          OUT="DirettaLocalPlayer-linux-${{ matrix.arch }}"
+          cp build/DirettaLocalPlayer "$OUT"
+          chmod +x "$OUT"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG 已存在，追加附件"
+          else
+            gh release create "$TAG" --title "$TAG" \
+              --notes "DirettaLocalPlayer 自动编译产物（${{ matrix.arch }}，SDK变体 ${{ matrix.sdk_arch }}）"
+          fi
+          gh release upload "$TAG" "$OUT" --clobber
+          echo "已上传: $OUT → $TAG"
+
+# =============================================================================
+# 【准备 SDK 的两种配法】
+#
+# ◆ 方式 A（推荐）：SDK 放一个你自己的私有仓库
+#   1) 在你已有的 Linux 机器上：
+#        cd ~/DirettaHostSDK_148
+#        git init && git add -A && git commit -m "Diretta Host SDK 148"
+#        git remote add origin https://github.com/top355/diretta-host-sdk.git   # 先建好私有仓库
+#        git push -u origin main
+#      ⚠ SDK 全体积可能上百 MB，单文件超 100MB 会被 GitHub 拒收，那就按架构裁剪后
+#        再推（只留 Host/ + lib/ 里你要的那两个变体）
+#   2) 建 fine-grained PAT：只勾这一个私有仓库的 Contents: Read-only
+#   3) 本仓库 Settings → Secrets and variables → Actions 加：
+#        SDK_REPO = top355/diretta-host-sdk
+#        SDK_PAT  = ghp_xxxxx
+#
+# ◆ 方式 B：gpg 加密包进本仓库（不用建私有仓库）
+#   1) 本地： tar czf DirettaHostSDK_148.tar.gz -C ~ DirettaHostSDK_148
+#            gpg --symmetric --cipher-algo AES256 DirettaHostSDK_148.tar.gz
+#   2) 把生成的 DirettaHostSDK_148.tar.gz.gpg 放到仓库 sdk/ 目录提交
+#   3) Secrets 加 SDK_PASSPHRASE = 你刚才设的口令
+#   4) 注释掉 workflow 里的「方式A」，打开「方式B」
+#
+# ⚠ 许可提醒：Diretta Host SDK 是 Yu Harada 的专有软件，授权范围是「个人使用」。
+#   放到 GitHub（哪怕私有仓库 / 加密）严格说都超出了原始分发意图，自己权衡，
+#   别设成 public 仓库。
+# =============================================================================

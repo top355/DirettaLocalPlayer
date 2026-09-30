@@ -348,15 +348,115 @@ jobs:
       #   云端 runner 是 AMD EPYC，CMakeLists 的 grep "amd.*zen 4" 可能命中，
       #   于是编出 -march=znver4 的二进制 —— 拿到没有 AVX512/Zen4 的机器上直接 SIGILL
       # ---------------------------------------------------------------------
+      # ---------------------------------------------------------------------
+      # glibc < 2.38 兼容垫片（解决 __isoc23_strtol undefined reference）
+      #
+      #   症状：链接 SDK 静态库时报
+      #       libACQUA_x64-linux-15v2.a(IPAddress.o): undefined reference to `__isoc23_strtol'
+      #
+      #   原因：SDK 的 .a 是用 glibc >= 2.38 的头文件 + GCC 14/15 编出来的，
+      #        那种组合会把 strtol() 重定向到 __isoc23_strtol（C23 语义），
+      #        而 ubuntu-22.04 的 glibc 只有 2.35，libc 里不存在这个符号。
+      #
+      #   对策：自己补一个等价实现，链进可执行文件。
+      #        C23 相对 C17 对 strtol 的唯一行为差异是接受 "0b"/"0B" 二进制前缀，
+      #        本项目只拿它解析 IP 字符串，无影响。
+      #        在 glibc >= 2.38 的机器上会编成空对象，链接时无副作用。
+      #
+      #   备选方案（不采用）：把 runner 换成 ubuntu-24.04（glibc 2.39，自带该符号）。
+      #        但那样产物会硬性要求 GLIBC_2.38+，Debian 12（glibc 2.36）等目标机
+      #        直接跑不起来 —— 与「产物要能在 Armbian 上跑」的目标冲突。
+      #
+      #   若将来 SDK 又冒出别的未定义符号，在这里照着加一行即可
+      #   （先看 make 日志里 undefined reference 的符号名）。
+      # ---------------------------------------------------------------------
+      - name: Add glibc C23 compat shim (__isoc23_*)
+        run: |
+          set -eo pipefail
+          D="$RUNNER_TEMP/glibc-compat"
+          mkdir -p "$D"
+
+          cat > "$D/isoc23_compat.c" <<'EOF'
+          #define _GNU_SOURCE
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <stdarg.h>
+          #include <inttypes.h>
+          #include <wchar.h>
+
+          #if defined(__GLIBC__) && (__GLIBC__ < 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ < 38))
+
+          long int __isoc23_strtol(const char *n, char **e, int b) { return strtol(n, e, b); }
+          unsigned long int __isoc23_strtoul(const char *n, char **e, int b) { return strtoul(n, e, b); }
+          long long int __isoc23_strtoll(const char *n, char **e, int b) { return strtoll(n, e, b); }
+          unsigned long long int __isoc23_strtoull(const char *n, char **e, int b) { return strtoull(n, e, b); }
+          intmax_t __isoc23_strtoimax(const char *n, char **e, int b) { return strtoimax(n, e, b); }
+          uintmax_t __isoc23_strtoumax(const char *n, char **e, int b) { return strtoumax(n, e, b); }
+
+          double __isoc23_strtod(const char *n, char **e) { return strtod(n, e); }
+          float __isoc23_strtof(const char *n, char **e) { return strtof(n, e); }
+          long double __isoc23_strtold(const char *n, char **e) { return strtold(n, e); }
+
+          int __isoc23_sscanf(const char *s, const char *f, ...) { va_list a; va_start(a, f); int r = vsscanf(s, f, a); va_end(a); return r; }
+          int __isoc23_fscanf(FILE *s, const char *f, ...) { va_list a; va_start(a, f); int r = vfscanf(s, f, a); va_end(a); return r; }
+          int __isoc23_scanf(const char *f, ...) { va_list a; va_start(a, f); int r = vscanf(f, a); va_end(a); return r; }
+          int __isoc23_vsscanf(const char *s, const char *f, va_list a) { return vsscanf(s, f, a); }
+          int __isoc23_vfscanf(FILE *s, const char *f, va_list a) { return vfscanf(s, f, a); }
+          int __isoc23_vscanf(const char *f, va_list a) { return vscanf(f, a); }
+
+          long int __isoc23_wcstol(const wchar_t *n, wchar_t **e, int b) { return wcstol(n, e, b); }
+          unsigned long int __isoc23_wcstoul(const wchar_t *n, wchar_t **e, int b) { return wcstoul(n, e, b); }
+          long long int __isoc23_wcstoll(const wchar_t *n, wchar_t **e, int b) { return wcstoll(n, e, b); }
+          unsigned long long int __isoc23_wcstoull(const wchar_t *n, wchar_t **e, int b) { return wcstoull(n, e, b); }
+          intmax_t __isoc23_wcstoimax(const wchar_t *n, wchar_t **e, int b) { return wcstoimax(n, e, b); }
+          uintmax_t __isoc23_wcstoumax(const wchar_t *n, wchar_t **e, int b) { return wcstoumax(n, e, b); }
+          double __isoc23_wcstod(const wchar_t *n, wchar_t **e) { return wcstod(n, e); }
+          float __isoc23_wcstof(const wchar_t *n, wchar_t **e) { return wcstof(n, e); }
+          long double __isoc23_wcstold(const wchar_t *n, wchar_t **e) { return wcstold(n, e); }
+
+          int __isoc23_swscanf(const wchar_t *s, const wchar_t *f, ...) { va_list a; va_start(a, f); int r = vswscanf(s, f, a); va_end(a); return r; }
+          int __isoc23_fwscanf(FILE *s, const wchar_t *f, ...) { va_list a; va_start(a, f); int r = vfwscanf(s, f, a); va_end(a); return r; }
+          int __isoc23_wscanf(const wchar_t *f, ...) { va_list a; va_start(a, f); int r = vwscanf(f, a); va_end(a); return r; }
+          int __isoc23_vswscanf(const wchar_t *s, const wchar_t *f, va_list a) { return vswscanf(s, f, a); }
+          int __isoc23_vfwscanf(FILE *s, const wchar_t *f, va_list a) { return vfwscanf(s, f, a); }
+          int __isoc23_vwscanf(const wchar_t *f, va_list a) { return vwscanf(f, a); }
+
+          #else
+          typedef int isoc23_compat_empty_t;
+          #endif
+          EOF
+
+          cc -O2 -fPIC -c "$D/isoc23_compat.c" -o "$D/isoc23_compat.o"
+
+          echo "==== 本机 libc 与垫片状态 ===="
+          echo "  $(getconf GNU_LIBC_VERSION 2>/dev/null || ldd --version | head -1)"
+          LIBC="$(ldd /bin/ls | awk '/libc\.so\.6/{print $3}' | head -1)"
+          if nm -D "$LIBC" 2>/dev/null | grep -q '__isoc23_strtol'; then
+            echo "  本机 libc 自带 __isoc23_strtol（glibc >= 2.38）→ 垫片为空对象，链接无副作用"
+          else
+            echo "  本机 libc 缺 __isoc23_strtol（glibc < 2.38）→ 垫片生效"
+          fi
+          echo "  垫片导出的符号数: $(nm -g --defined-only "$D/isoc23_compat.o" 2>/dev/null | wc -l)"
+
+          echo "SHIM_OBJ=$D/isoc23_compat.o" >> "$GITHUB_ENV"
+
       - name: Configure
         run: |
-          set -e
+          set -eo pipefail
           echo "==== cmake 将用到的 FFmpeg（应为 /usr/local 下源码构建的那套）===="
           for p in libavcodec libavformat libavutil libswresample; do
             echo "  $p = $(pkg-config --modversion "$p")   libdir=$(pkg-config --variable=libdir "$p")"
           done
           mkdir -p build && cd build
-          cmake .. -DDIRETTA_ARCH=${{ matrix.sdk_arch }}
+          # 通过 CMAKE_EXE_LINKER_FLAGS 注入 glibc 兼容垫片。
+          #   CMakeLists.txt 里从未设置过这个变量，所以 -D 不会被覆盖；
+          #   对象文件会排在 OBJECTS 之前，而对象文件的符号始终参与全局解析，
+          #   足以补上后面 .a 里的未定义引用。
+          cmake .. -DDIRETTA_ARCH=${{ matrix.sdk_arch }} \
+                   -DCMAKE_EXE_LINKER_FLAGS="${SHIM_OBJ:-}"
+          echo "==== 确认垫片已进入链接参数 ===="
+          grep -E '^CMAKE_EXE_LINKER_FLAGS' CMakeCache.txt || echo "  (未写入，链接可能仍失败)"
+          ls -l "${SHIM_OBJ:-/dev/null}" 2>/dev/null || true
           echo "==== 实际选中的 SDK 变体 / 编译参数 ===="
           grep -i -E "Selecting Diretta SDK variant|Using Diretta SDK|compile_options|CMAKE_CXX_FLAGS" \
             CMakeCache.txt CMakeFiles/CMakeOutput.log 2>/dev/null | head -10 || true
@@ -367,9 +467,20 @@ jobs:
         run: |
           set -eo pipefail
           cd build
-          # pipefail：不加的话 make 失败会被 tail 的 0 退出码吞掉，
-          # 最后只看到一句 "ls: cannot access 'DirettaLocalPlayer'"，看不出真因
-          make -j"$(nproc)" 2>&1 | tail -60
+          # 先把完整日志落盘，再挑关键错误行 —— 避免 make 的真因被 tail 截掉
+          set +e
+          make -j"$(nproc)" > /tmp/make.log 2>&1
+          rc=$?
+          set -e
+          echo "---- make 日志尾部 ----"
+          tail -40 /tmp/make.log
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::make 失败 (exit=$rc)"
+            echo "---- 关键错误行 ----"
+            grep -n -E "undefined reference|multiple definition|error:|Error [0-9]+" /tmp/make.log | head -40 || true
+            echo "---- 若是 undefined reference，把符号名加到「Add glibc C23 compat shim」里 ----"
+            exit "$rc"
+          fi
           echo "==== 产物 ===="
           ls -lh DirettaLocalPlayer
           file DirettaLocalPlayer

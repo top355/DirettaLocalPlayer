@@ -111,15 +111,72 @@ jobs:
           esac
           echo "将从私有仓库拉取 SDK: ${SDK_REPO}"
 
-          if ! git clone --depth 1 --quiet \
-                 "https://x-access-token:${SDK_PAT}@github.com/${SDK_REPO}.git" \
-                 "$DIRETTA_SDK_PATH" 2>/tmp/sdk_clone.err; then
-            echo "::error::拉取 SDK 失败。常见原因：① SDK_REPO 写错 ② PAT 过期 ③ PAT 未勾选该私有仓库 ④ PAT 缺 Contents:Read"
-            echo "---- git 原始错误（token 已脱敏）----"
-            sed -E 's|x-access-token:[^@]*@|x-access-token:***@|g' /tmp/sdk_clone.err || true
+          rm -rf "$DIRETTA_SDK_PATH"; mkdir -p "$DIRETTA_SDK_PATH"
+          ok=0
+
+          # ---- 首选：REST API tarball ----
+          # 绕开 git 协议的鉴权路径，且错误码可区分：
+          #   401=token 串错/过期   404=token 未授权访问该仓库   403=权限不足或需 SSO
+          echo "---- 方式1: REST API tarball ----"
+          code=$(curl -sL -m 300 -o /tmp/sdk.tar.gz -w '%{http_code}' \
+                   -H "Authorization: Bearer ${SDK_PAT}" \
+                   -H "Accept: application/vnd.github+json" \
+                   "https://api.github.com/repos/${SDK_REPO}/tarball" || echo 000)
+          printf '   HTTP %s，下载 %s 字节\n' "$code" "$(stat -c%s /tmp/sdk.tar.gz 2>/dev/null || echo 0)"
+          if [ "$code" = "200" ] && tar tzf /tmp/sdk.tar.gz >/dev/null 2>&1; then
+            tar xzf /tmp/sdk.tar.gz -C "$DIRETTA_SDK_PATH" --strip-components=1
+            ok=1
+          fi
+
+          # ---- 兜底：git clone（用户名依次试 oauth2 / x-access-token）----
+          if [ "$ok" != "1" ]; then
+            echo "---- 方式2: git clone ----"
+            for u in oauth2 x-access-token; do
+              rm -rf "$DIRETTA_SDK_PATH"; mkdir -p "$DIRETTA_SDK_PATH"
+              if git clone --depth 1 --quiet \
+                   "https://${u}:${SDK_PAT}@github.com/${SDK_REPO}.git" \
+                   "$DIRETTA_SDK_PATH" 2>/tmp/sdk_clone.err; then
+                echo "   git clone (${u}) 成功"
+                ok=1; break
+              fi
+              echo "   git clone (${u}) 失败:"
+              sed -E "s|${u}:[^@]*@|${u}:***@|g" /tmp/sdk_clone.err \
+                | sed "s|${SDK_PAT}|***|g" | sed 's/^/     /' || true
+            done
+          fi
+
+          # ---- 两种方式都失败 → 精确诊断，直接指出是 4 个原因里的哪一个 ----
+          if [ "$ok" != "1" ]; then
+            echo "::error::拉取 SDK 失败，见下方诊断"
+            echo "---- ① token 归属与类型 ----"
+            curl -s -m 20 -H "Authorization: Bearer ${SDK_PAT}" https://api.github.com/user \
+              -o /tmp/ghuser.json -w "   GET /user -> HTTP %{http_code}\n" || true
+            grep -o '"login":[^,]*' /tmp/ghuser.json 2>/dev/null | head -1 | sed 's/^/   /' || true
+            grep -o '"message":[^,]*' /tmp/ghuser.json 2>/dev/null | head -1 | sed 's/^/   /' || true
+            printf '   token 前缀: %s*** (长度 %s)\n' "$(printf '%s' "$SDK_PAT" | cut -c1-11)" "${#SDK_PAT}"
+            curl -s -m 20 -o /dev/null -D - -H "Authorization: Bearer ${SDK_PAT}" \
+              https://api.github.com/user | tr -d '\r' | grep -i '^x-oauth-scopes:' \
+              | sed 's/^/   /' \
+              || echo "   (无 x-oauth-scopes 头 → fine-grained PAT；classic PAT 会列出 scopes)"
+
+            echo "---- ② token 能否看到 ${SDK_REPO} ----"
+            curl -s -m 20 -H "Authorization: Bearer ${SDK_PAT}" \
+              "https://api.github.com/repos/${SDK_REPO}" -o /tmp/ghrepo.json \
+              -w "   GET /repos/${SDK_REPO} -> HTTP %{http_code}\n" || true
+            grep -o '"message":[^,]*' /tmp/ghrepo.json 2>/dev/null | head -1 | sed 's/^/   /' || true
+            grep -o '"permissions":{[^}]*}' /tmp/ghrepo.json 2>/dev/null | head -1 | sed 's/^/   /' || true
+
+            echo "---- ③ 对照结论 ----"
+            echo "   /user 401            → PAT 串复制错了，或已过期"
+            echo "   /user 200 但 login 不是仓库属主 → PAT 建在了别的账号下，重新在正确账号下建"
+            echo "   /repos 404           → PAT 的 Repository access 里没勾上 ${SDK_REPO}"
+            echo "   /repos 403           → 组织仓库需 SSO 授权（按返回里的 URL 点一下）"
+            echo "   /repos 200 但上面 tarball 403 → PAT 的 Contents 权限不足，须设为 Read"
+            echo "   classic PAT 的 scopes 里没有 repo → 勾上 repo 后重新生成"
             exit 1
           fi
           echo "SDK 已拉取到: $DIRETTA_SDK_PATH"
+          ls -1 "$DIRETTA_SDK_PATH" | head -10
 
       # ---------------------------------------------------------------------
       # 取 SDK —— 方式 B：gpg 加密包提交进本仓库，口令存 Secrets

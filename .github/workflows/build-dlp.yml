@@ -126,6 +126,17 @@ jobs:
           if [ "$code" = "200" ] && tar tzf /tmp/sdk.tar.gz >/dev/null 2>&1; then
             tar xzf /tmp/sdk.tar.gz -C "$DIRETTA_SDK_PATH" --strip-components=1
             ok=1
+          else
+            # ★ 失败时务必把响应体打出来 —— GitHub 的 403 正文里就写着真正原因
+            echo "   ---- 响应体原文（token 已脱敏）----"
+            head -c 600 /tmp/sdk.tar.gz 2>/dev/null \
+              | sed "s|${SDK_PAT}|***|g" | sed 's/^/     /' || true
+            echo
+            if grep -q 'Resource not accessible by personal access token' /tmp/sdk.tar.gz 2>/dev/null; then
+              echo "   >>> 确诊：fine-grained PAT 缺 Contents 权限"
+              echo "   >>> 修法：编辑该 token → Repository permissions → Contents 设为 Read-only"
+              echo "   >>>       （改权限不会改变 token 值，无需重配 Secret）"
+            fi
           fi
 
           # ---- 兜底：git clone（用户名依次试 oauth2 / x-access-token）----
@@ -149,8 +160,9 @@ jobs:
           if [ "$ok" != "1" ]; then
             echo "::error::拉取 SDK 失败，见下方诊断"
             echo "---- ① token 归属与类型 ----"
-            curl -s -m 20 -H "Authorization: Bearer ${SDK_PAT}" https://api.github.com/user \
-              -o /tmp/ghuser.json -w "   GET /user -> HTTP %{http_code}\n" || true
+            UCODE=$(curl -s -m 20 -H "Authorization: Bearer ${SDK_PAT}" https://api.github.com/user \
+              -o /tmp/ghuser.json -w '%{http_code}' || echo 000)
+            echo "   GET /user -> HTTP ${UCODE}"
             grep -o '"login":[^,]*' /tmp/ghuser.json 2>/dev/null | head -1 | sed 's/^/   /' || true
             grep -o '"message":[^,]*' /tmp/ghuser.json 2>/dev/null | head -1 | sed 's/^/   /' || true
             printf '   token 前缀: %s*** (长度 %s)\n' "$(printf '%s' "$SDK_PAT" | cut -c1-11)" "${#SDK_PAT}"
@@ -159,20 +171,31 @@ jobs:
               | sed 's/^/   /' \
               || echo "   (无 x-oauth-scopes 头 → fine-grained PAT；classic PAT 会列出 scopes)"
 
-            echo "---- ② token 能否看到 ${SDK_REPO} ----"
-            curl -s -m 20 -H "Authorization: Bearer ${SDK_PAT}" \
+            echo "---- ② token 能否看到目标仓库 ----"
+            RCODE=$(curl -s -m 20 -H "Authorization: Bearer ${SDK_PAT}" \
               "https://api.github.com/repos/${SDK_REPO}" -o /tmp/ghrepo.json \
-              -w "   GET /repos/${SDK_REPO} -> HTTP %{http_code}\n" || true
+              -w '%{http_code}' || echo 000)
+            echo "   GET /repos/${SDK_REPO} -> HTTP ${RCODE}"
             grep -o '"message":[^,]*' /tmp/ghrepo.json 2>/dev/null | head -1 | sed 's/^/   /' || true
             grep -o '"permissions":{[^}]*}' /tmp/ghrepo.json 2>/dev/null | head -1 | sed 's/^/   /' || true
 
-            echo "---- ③ 对照结论 ----"
-            echo "   /user 401            → PAT 串复制错了，或已过期"
-            echo "   /user 200 但 login 不是仓库属主 → PAT 建在了别的账号下，重新在正确账号下建"
-            echo "   /repos 404           → PAT 的 Repository access 里没勾上 ${SDK_REPO}"
-            echo "   /repos 403           → 组织仓库需 SSO 授权（按返回里的 URL 点一下）"
-            echo "   /repos 200 但上面 tarball 403 → PAT 的 Contents 权限不足，须设为 Read"
-            echo "   classic PAT 的 scopes 里没有 repo → 勾上 repo 后重新生成"
+            echo "---- ③ 判定（按上面两个状态码直接给结论）----"
+            if [ "$UCODE" = "401" ]; then
+              echo "   ⇒ token 串复制错了，或已过期 → 重新生成 PAT 并更新 Secret"
+            elif [ "$RCODE" = "404" ]; then
+              echo "   ⇒ PAT 的 Repository access 里没勾上该仓库（GET /repos 对未授权仓库故意返 404）"
+            elif [ "$RCODE" = "403" ]; then
+              echo "   ⇒ 组织仓库需 SSO 授权（按响应里的 URL 点一下授权）"
+            elif [ "$RCODE" = "200" ]; then
+              echo "   ⇒ token 能看到仓库（Repository access 正常），但读不到内容"
+              echo "     ⇒ 缺 Contents 权限：编辑该 token → Repository permissions →"
+              echo "        Contents = Read-only → 保存。token 值不变，Secret 不用改"
+              echo "     ⇒ 若上一步响应体写的是 Resource not accessible by personal access token，"
+              echo "        即为本因的确认"
+            else
+              echo "   ⇒ 未归类的组合，见上面 HTTP 码与响应体"
+            fi
+            echo "   （注：日志里仓库名显示为 *** 是 GitHub 的 secret 脱敏，不是写错）"
             exit 1
           fi
           echo "SDK 已拉取到: $DIRETTA_SDK_PATH"

@@ -45,16 +45,16 @@ jobs:
           # ---- glibc 2.35 / FFmpeg 4.4：兼容优先（Debian 11+ / Ubuntu 22.04+ 都能跑）----
           - runner: ubuntu-22.04
             arch: x64
-            sdk_arch: x64-linux-15v3        # AVX2 / -march=haswell，兼容面最广
+            sdk_arch: x64-linux-15v2        # 基线 x86-64（-march=x86-64，不用 AVX2），兼容面最广
           - runner: ubuntu-22.04-arm
             arch: arm64
-            sdk_arch: aarch64-linux-15
+            sdk_arch: aarch64-linux-15      # 非 16K 页（getconf PAGESIZE=4096），已确认
 
           # ---- 若 22.04 的 FFmpeg 4.4 太老编不过，改用这组（glibc 2.39 / FFmpeg 6.1）----
           #      注意：glibc 2.39 的产物在 Debian 11 等老系统上会直接跑不起来
           # - runner: ubuntu-24.04
           #   arch: x64
-          #   sdk_arch: x64-linux-15v3
+          #   sdk_arch: x64-linux-15v2
           # - runner: ubuntu-24.04-arm
           #   arch: arm64
           #   sdk_arch: aarch64-linux-15
